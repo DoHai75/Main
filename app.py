@@ -122,25 +122,27 @@ automasker = AutoMasker(
 def submit_function(
     person_image,
     cloth_image,
-    cloth_type,
+    cloth_type, 
     num_inference_steps,
     guidance_scale,
     seed,
     show_type
 ):
     person_image, mask = person_image["background"], person_image["layers"][0]
-    mask = Image.open(mask).convert("L")
+    mask = Image.open(mask).convert("L")#đọc ảnh từ mask và chuyển về dạng 0-255
+    mask = None
+    '''''
     if len(np.unique(np.array(mask))) == 1:
-        mask = None
+        mask = None# đưa mask về None để sau này dùng automasker
     else:
         mask = np.array(mask)
         mask[mask > 0] = 255
         mask = Image.fromarray(mask)
-
+   '''''
     tmp_folder = args.output_dir
     date_str = datetime.now().strftime("%Y%m%d%H%M%S")
-    result_save_path = os.path.join(tmp_folder, date_str[:8], date_str[8:] + ".png")
-    if not os.path.exists(os.path.join(tmp_folder, date_str[:8])):
+    result_save_path = os.path.join(tmp_folder, date_str[:8], date_str[8:] + ".png")#os.path.join biến dấu , trong () thành /
+    if not os.path.exists(os.path.join(tmp_folder, date_str[:8])):#not os.path.exists kiểm tra xem thư mục trong () có tồn tại khongg
         os.makedirs(os.path.join(tmp_folder, date_str[:8]))
 
     generator = None
