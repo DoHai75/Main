@@ -323,3 +323,113 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+#Dynamic Batching 
+import asyncio
+import time
+from typing import Any, Dict, Tuple
+import torch
+from model.cloth_masker import AutoMasker, vis_mask  # existing imports
+from utils import init_weight_dtype, resize_and_crop, resize_and_padding  # existing utilities
+from app import submit_function
+# --- Dynamic Batching Setup ---
+# Queue storing tuples of (payload, Future)
+inference_queue: asyncio.Queue[Tuple[Dict[str, Any], asyncio.Future]] = asyncio.Queue()
+MAX_BATCH = 8      # max number of requests per batch
+timeout = 2.0      # seconds to wait for batch fill
+
+# Executor for running inference off the event loop
+from concurrent.futures import ThreadPoolExecutor
+executor = ThreadPoolExecutor()  # unlimited by default
+
+# Helper: synchronous inference call
+def sync_inference(batch_inputs):
+    results = []
+    for payload in batch_inputs:
+        person_dict = payload["person_dict"]
+        cloth_path = payload["cloth_path"]
+        cloth_type = payload["cloth_type"]
+        num_steps = payload["num_inference_steps"]
+        guidance = payload["guidance_scale"]
+        seed = payload["seed"]
+        show_type = payload["show_type"]
+        with torch.cuda.amp.autocast(enabled=True):
+            img = submit_function(
+                person_dict,
+                cloth_path,
+                cloth_type,
+                num_steps,
+                guidance,
+                seed,
+                show_type
+            )
+        results.append(img)
+    return results
+
+# Dynamic batching coroutine
+async def batching_loop():
+    loop = asyncio.get_event_loop()
+    while True:
+        # 1. Block until at least one request
+        payload, fut = await inference_queue.get()
+        batch = [(payload, fut)]
+        start_time = time.time()
+
+        # 2. Collect up to MAX_BATCH or until timeout
+        while len(batch) < MAX_BATCH and (time.time() - start_time) < timeout:
+            try:
+                p, f = inference_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                await asyncio.sleep(0)
+            else:
+                batch.append((p, f))
+
+        # 3. Log batch size & queue
+        batch_size = len(batch)
+        queue_size = inference_queue.qsize()
+        print(f"[dynamic-batch] ⏱ {time.strftime('%H:%M:%S')} ▶ Collected {batch_size} requests (waiting: {queue_size})")
+
+        # 4. Separate payloads and futures
+        batch_payloads = [p for p, _ in batch]
+        futures_list  = [f for _, f in batch]
+
+        # 5. Off-load to executor without blocking
+        async def run_batch(batch_payloads, futures_list):
+            try:
+                print(f"[dynamic-batch] 🚀 Start batch with {len(batch_payloads)} requests")
+                outputs = await loop.run_in_executor(executor, sync_inference, batch_payloads)
+                for fut, out in zip(futures_list, outputs):
+                    if not fut.done():
+                        fut.set_result(out)
+                print(f"[dynamic-batch] ✅ Finished batch of size {len(batch_payloads)}")
+            except Exception as e:
+                print(f"[dynamic-batch] ❌ Batch failed: {e}")
+                for fut in futures_list:
+                    if not fut.done():
+                        fut.set_exception(e)
+
+        asyncio.create_task(run_batch(batch_payloads, futures_list))
+
+# Client API to be used in FastAPI
+async def submit_request(
+    person_dict: Dict[str, Any],
+    cloth_path: str,
+    cloth_type: str,
+    num_inference_steps: int,
+    guidance_scale: float,
+    seed: int,
+    show_type: str
+) -> Any:
+    payload = {
+        "person_dict": person_dict,
+        "cloth_path": cloth_path,
+        "cloth_type": cloth_type,
+        "num_inference_steps": num_inference_steps,
+        "guidance_scale": guidance_scale,
+        "seed": seed,
+        "show_type": show_type
+    }
+    fut = asyncio.get_event_loop().create_future()
+    await inference_queue.put((payload, fut))
+    return await fut
+
